@@ -72,6 +72,7 @@ class _SlashGateway
   Object? slashError;
   Object? dispatchError;
   Object? resumeExistingError;
+  bool explicitStoredIdentity = true;
   Object? modelError;
   Object? submitError;
   final List<DesktopModelSelection> modelSelections = [];
@@ -124,6 +125,7 @@ class _SlashGateway
       runtimeSessionId: 'runtime-slash-test',
       storedSessionId: storedSessionId,
       created: false,
+      storedSessionIdentityExplicit: explicitStoredIdentity,
       messagesProvided: true,
       messageCount: 0,
     );
@@ -693,6 +695,37 @@ void main() {
       },
     );
   });
+
+  test(
+    'existing session resume keeps the requested stored identity fallback',
+    () async {
+      final gateway = _SlashGateway()..explicitStoredIdentity = false;
+      final service = ActiveChatService();
+      addTearDown(service.dispose);
+      final chat = service.attach(
+        connection: _connection(),
+        sessionId: 'pinned-existing-chat',
+        initialStoredSessionId: 'pinned-existing-chat',
+        sessionTitle: 'Existing chat',
+        sessionProfile: 'coding',
+        api: _safeApi(),
+        desktopGateway: gateway,
+        disableForegroundKeepAlive: true,
+      );
+
+      final sent = await chat.send(
+        fullText: 'Continue this conversation',
+        model: 'hermes-agent',
+        history: const [],
+        profile: 'coding',
+      );
+
+      expect(sent, isTrue);
+      expect(chat.storedSessionId, 'pinned-existing-chat');
+      expect(chat.desktopRuntimeSessionId, 'runtime-slash-test');
+      expect(gateway.submissions, ['Continue this conversation']);
+    },
+  );
 
   group('slashSuggestionsFor', () {
     test('vacío si no empieza por /', () {
