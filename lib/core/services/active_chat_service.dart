@@ -19320,8 +19320,8 @@ class ActiveChat {
             durableId.isEmpty ||
             durableId != durableId.trim() ||
             !binding.identityAliasesConsistent ||
-            (binding.created && !binding.storedSessionIdentityExplicit) ||
-            (!binding.created && durableId != (storedId ?? source))) {
+            (!binding.storedSessionIdentityExplicit &&
+                (binding.created || durableId != (storedId ?? source)))) {
           throw const TuiGatewayRpcError(
             'session',
             'Hermes returned an invalid first-action binding',
