@@ -1,0 +1,104 @@
+name: Fork test APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [fix/first-skill-command]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-test-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.repository == 'Zioyre/hermes-console'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install pinned Flutter SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch 3.47.7 https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          test "$(git -C "$RUNNER_TEMP/flutter" rev-parse HEAD)" = abaf9c523780a608bd46686fd5e53740a07077f8
+          printf '%s\n' "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/flutter/bin/flutter" --version
+
+      - name: Verify wrapper and install locked dependencies
+        run: |
+          printf '%s\n' '76805e32c009c0cf0dd5d206bddc9fb22ea42e84db904b764f3047de095493f3  android/gradle/wrapper/gradle-wrapper.jar' | sha256sum --strict -c -
+          flutter pub get --enforce-lockfile
+
+      - name: Analyze
+        run: flutter analyze --no-pub --fatal-infos
+
+      - name: Test command and session regressions
+        run: |
+          flutter test --no-pub --concurrency=2 --reporter=expanded \
+            test/slash_commands_test.dart \
+            test/skill_command_payload_test.dart \
+            test/capability_payload_sanitizer_test.dart \
+            test/tui_gateway_commands_contract_test.dart \
+            test/command_registry_test.dart \
+            test/active_chat_session_config_test.dart \
+            test/chat_send_durable_route_test.dart \
+            test/chat_session_config_scope_test.dart \
+            test/desktop_disconnect_recovery_test.dart
+
+      - name: Limit build memory
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('android/gradle.properties')
+          lines = path.read_text().splitlines()
+          lines = [line for line in lines if not line.startswith(('org.gradle.jvmargs=', 'org.gradle.workers.max=', 'kotlin.compiler.execution.strategy='))]
+          lines += ['org.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=1G -XX:ReservedCodeCacheSize=256m', 'org.gradle.workers.max=2', 'kotlin.compiler.execution.strategy=in-process']
+          path.write_text('\n'.join(lines) + '\n')
+          PY
+
+      - name: Build separate ARM64 test app
+        run: flutter build apk --debug --flavor qa --target-platform android-arm64 --no-pub
+
+      - name: Verify APK and record checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-qa-debug.apk dist/hermes-console-skill-fix-arm64-debug.apk
+          tools="$ANDROID_HOME/build-tools/36.0.0"
+          "$tools/apksigner" verify --verbose dist/hermes-console-skill-fix-arm64-debug.apk
+          "$tools/aapt" dump badging dist/hermes-console-skill-fix-arm64-debug.apk > dist/apk-metadata.txt
+          grep -F "package: name='dev.xpetalab.hermesconsole.qa'" dist/apk-metadata.txt
+          grep -F "native-code: 'arm64-v8a'" dist/apk-metadata.txt
+          (cd dist && sha256sum hermes-console-skill-fix-arm64-debug.apk > SHA256SUMS)
+          {
+            printf '%s\n' '## Unofficial test APK' ''
+            printf '%s\n' 'ARM64 Android debug build. Installs beside the official app as dev.xpetalab.hermesconsole.qa. Configure the server connection in this separate app.' ''
+            printf 'Source commit: `%s`\n\n' "$GITHUB_SHA"
+            printf '%s\n' '```text'
+            cat dist/SHA256SUMS
+            printf '%s\n' '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: hermes-console-skill-fix-arm64-debug
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0

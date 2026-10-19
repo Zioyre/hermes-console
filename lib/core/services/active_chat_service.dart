@@ -6246,7 +6246,17 @@ class ActiveChat {
 
   void stageFirstSubmitConfig(DesktopSessionCreateConfig config) {
     if (mutationsBlockedByOwnershipConflict) return;
-    if (_desktopRuntimeSessionId == null) _stagedFirstSubmitConfig = config;
+    if (_desktopRuntimeSessionId == null) {
+      if (_desktopFirstBindingConfig != null &&
+          config != _desktopFirstBindingConfig) {
+        throw const TuiGatewayRpcError(
+          'session.create',
+          'First-action configuration is already being bound',
+          code: 4009,
+        );
+      }
+      _stagedFirstSubmitConfig = config;
+    }
   }
 
   @visibleForTesting
@@ -9561,6 +9571,9 @@ class ActiveChat {
   // never constructor metadata, logicalId, passive snapshots or a voice tip.
   String? _createdDraftSessionId;
   String? get createdDraftSessionId => _createdDraftSessionId;
+  Future<DesktopSessionBinding>? _desktopFirstBindingFlight;
+  DesktopSessionCreateConfig? _desktopFirstBindingConfig;
+  bool _desktopSlashInFlight = false;
 
   /// Mission Rooms require Hermes' canonical create/resume lifecycle so their
   /// manager pin can be replaced with a server-confirmed stored id. Endpoint
@@ -17100,7 +17113,21 @@ class ActiveChat {
   Future<DesktopCommandRpcResult> executeDesktopSlash(
     String name, {
     String arg = '',
-  }) => _trackRuntimeMutation(() => _executeDesktopSlash(name, arg: arg));
+  }) {
+    if (_desktopSlashInFlight) {
+      return Future.error(
+        const TuiGatewayRpcError(
+          'slash.exec',
+          'A command is already in flight',
+          code: 4009,
+        ),
+      );
+    }
+    _desktopSlashInFlight = true;
+    return _trackRuntimeMutation(
+      () => _executeDesktopSlash(name, arg: arg),
+    ).whenComplete(() => _desktopSlashInFlight = false);
+  }
 
   Future<DesktopCommandRpcResult> _executeDesktopSlash(
     String name, {
@@ -17139,26 +17166,98 @@ class ActiveChat {
         code: 4004,
       );
     }
-    if (!await ensureDesktopRuntime(acquireForExplicitAction: true)) {
-      throw const TuiGatewayRpcError(
-        'slash.exec',
-        'No live runtime is available for this command',
-        code: 4007,
-      );
-    }
     final gateway = _desktopGateway;
-    final runtimeId = _desktopRuntimeSessionId;
-    if (gateway is! HermesDesktopCommandGateway || runtimeId == null) {
+    final owner = _sessionProfileOwner;
+    final config = _stagedFirstSubmitConfig;
+    final lifecycle = _localConversationLifecycle;
+    if (gateway is! HermesDesktopCommandGateway) {
       throw const TuiGatewayRpcError(
         'slash.exec',
         'Desktop command dispatch is unsupported',
         code: -32601,
       );
     }
+    final operation = LocalConversationCleanupFence.admitOperation(
+      connectionId: connection.id,
+      profile: sessionProfile,
+      sessionId: sessionId,
+      lifecycle: lifecycle,
+      kind: LocalConversationOperationKind.projection,
+    );
+    void ensureCurrent() {
+      LocalConversationCleanupFence.ensureOperationAllowed(operation);
+      if (_disposed ||
+          connection.readOnly ||
+          mutationsBlockedByOwnershipConflict ||
+          _sessionProfileOwner != owner ||
+          !identical(gateway, _desktopGateway)) {
+        throw const LocalConversationWriteRejected();
+      }
+    }
+
+    ensureCurrent();
+    final isUnboundMobileDraft =
+        _desktopRuntimeSessionId == null &&
+        _desktopStoredSessionId == null &&
+        serverSessionId == sessionId &&
+        sessionId.startsWith('mob-') &&
+        _messages.isEmpty;
+    if (isUnboundMobileDraft) {
+      if (!config.createIfMissing ||
+          owner == null ||
+          gateway is! HermesDesktopConfiguredSessionLifecycleGateway ||
+          gateway is! HermesDesktopSessionLifecycleGateway) {
+        throw const TuiGatewayRpcError(
+          'slash.exec',
+          'Draft command requires configured session creation and a bound owner',
+          code: -32601,
+        );
+      }
+      await gateway!.connect();
+      ensureCurrent();
+      await _bindDesktopSessionForFirstAction(
+        gateway,
+        profile: owner,
+        history: const [],
+        legacyModel: '',
+        config: config,
+      );
+    } else if (!await ensureDesktopRuntime(acquireForExplicitAction: true)) {
+      throw const TuiGatewayRpcError(
+        'slash.exec',
+        'No live runtime is available for this command',
+        code: 4007,
+      );
+    }
+    ensureCurrent();
+    final runtimeId = _desktopRuntimeSessionId;
+    final durableId = _desktopStoredSessionId;
+    final bindEpoch = _desktopBindEpoch;
+    final sessionEpoch = _desktopSessionEpoch;
+    if (runtimeId == null) {
+      throw const TuiGatewayRpcError(
+        'slash.exec',
+        'No live runtime is available for this command',
+        code: 4007,
+      );
+    }
+    void ensureDispatchCurrent() {
+      ensureCurrent();
+      if (_desktopRuntimeSessionId != runtimeId ||
+          _desktopStoredSessionId != durableId ||
+          _desktopBindEpoch != bindEpoch ||
+          _desktopSessionEpoch != sessionEpoch) {
+        throw const LocalConversationWriteRejected();
+      }
+    }
+
     final command = argument.isEmpty ? canonical : '$canonical $argument';
     final commands = gateway as HermesDesktopCommandGateway;
     try {
-      return await commands.slashExec(runtimeId, command);
+      ensureDispatchCurrent();
+      final result = await commands.slashExec(runtimeId, command);
+      ensureDispatchCurrent();
+      return result;
     } on TuiGatewayRpcError catch (slashError) {
       // Desktop `use-prompt-actions/slash.ts` retries command.dispatch on any
       // slash.exec error. Here only the gateway's own refusal before running
@@ -17168,11 +17267,14 @@ class ActiveChat {
       // name, the slash.exec error is the real failure.
       if (!_slashExecRefusedBeforeRunning(slashError)) rethrow;
       try {
-        return await commands.commandDispatch(
+        ensureDispatchCurrent();
+        final result = await commands.commandDispatch(
           runtimeId,
           name: canonical,
           arg: argument,
         );
+        ensureDispatchCurrent();
+        return result;
       } on TuiGatewayRpcError catch (dispatchError) {
         if (_notADispatchCommand.hasMatch(dispatchError.message)) {
           throw slashError;
@@ -19141,9 +19243,133 @@ class ActiveChat {
     );
   }
 
-  /// Binds an existing durable session or creates a new runtime only after the
-  /// first submit. Modern gateways keep resume and create separate so a 4007
-  /// during read/recovery can never generate server-side session garbage.
+  /// Binding and adoption are one flight shared by explicit draft commands and
+  /// the first prompt. Recovery acquisition deliberately does not call this.
+  Future<DesktopSessionBinding> _bindDesktopSessionForFirstAction(
+    HermesDesktopGateway gateway, {
+    required String profile,
+    required List<Map<String, dynamic>> history,
+    required String legacyModel,
+    required DesktopSessionCreateConfig config,
+  }) {
+    final pending = _desktopFirstBindingFlight;
+    if (pending != null) {
+      if (config != _desktopFirstBindingConfig) {
+        return Future.error(
+          const TuiGatewayRpcError(
+            'session.create',
+            'First-action configuration changed while binding',
+            code: 4009,
+          ),
+        );
+      }
+      return pending;
+    }
+    final source = serverSessionId;
+    final storedId = _desktopStoredSessionId;
+    final sessionEpoch = _desktopSessionEpoch;
+    final bindEpoch = _desktopBindEpoch;
+    final owner = _sessionProfileOwner;
+    final lifecycle = _localConversationLifecycle;
+    final operation = LocalConversationCleanupFence.admitOperation(
+      connectionId: connection.id,
+      profile: profile,
+      sessionId: sessionId,
+      lifecycle: lifecycle,
+      kind: LocalConversationOperationKind.projection,
+    );
+    final heldConnectionRequest = _connectionCard.request;
+    void ensureCurrent() {
+      LocalConversationCleanupFence.ensureOperationAllowed(operation);
+      if (_disposed ||
+          connection.readOnly ||
+          mutationsBlockedByOwnershipConflict ||
+          !identical(gateway, _desktopGateway) ||
+          _sessionProfileOwner != owner ||
+          sessionProfile != profile ||
+          _desktopStoredSessionId != storedId ||
+          serverSessionId != source ||
+          _desktopRuntimeSessionId != null ||
+          _desktopSessionEpoch != sessionEpoch ||
+          _desktopBindEpoch != bindEpoch) {
+        throw const LocalConversationWriteRejected();
+      }
+    }
+
+    var createRequested = false;
+    _desktopFirstBindingConfig = config;
+    Future<DesktopSessionBinding> bind() async {
+      try {
+        ensureCurrent();
+        _listenToDesktopGateway(gateway);
+        createRequested =
+            storedId == null &&
+            (sessionId.startsWith('mob-') || _desktopStoredSessionKnownMissing);
+        final binding = await _bindDesktopSessionForFirstSubmit(
+          gateway,
+          profile: profile,
+          history: history,
+          legacyModel: legacyModel,
+          config: config,
+        );
+        ensureCurrent();
+        final runtimeId = binding.runtimeSessionId;
+        final durableId = binding.storedSessionId;
+        if (runtimeId.isEmpty ||
+            runtimeId != runtimeId.trim() ||
+            durableId.isEmpty ||
+            durableId != durableId.trim() ||
+            !binding.identityAliasesConsistent ||
+            !binding.storedSessionIdentityExplicit ||
+            (!binding.created && storedId != null && durableId != storedId)) {
+          throw const TuiGatewayRpcError(
+            'session',
+            'Hermes returned an invalid first-action binding',
+          );
+        }
+        if (binding.created && storedId == null && source == sessionId) {
+          _createdDraftSessionId ??= durableId;
+          if (lifecycle != null) {
+            LocalConversationCleanupFence.authorizeCreatedSession(
+              lifecycle,
+              durableId,
+            );
+          }
+        }
+        _desktopStoredSessionId = durableId;
+        _desktopStoredSessionKnownMissing = false;
+        _adoptDesktopRuntime(runtimeId, info: binding.info);
+        _hydrateAgentTasks(binding.todoState, running: binding.running);
+        _restorePendingConnection(
+          binding,
+          heldAtResumeStart: heldConnectionRequest,
+        );
+        if (binding.created && _stagedFirstSubmitConfig == config) {
+          _stagedFirstSubmitConfig = const DesktopSessionCreateConfig();
+        }
+        if (binding.info != _desktopRuntimeInfo) {
+          _desktopRuntimeInfo = binding.info;
+          _emit(ActiveChatEvent.sessionInfo);
+        }
+        _desktopFirstBindingFlight = null;
+        _desktopFirstBindingConfig = null;
+        return binding;
+      } catch (_) {
+        // A lost create reply may already have allocated a runtime. Retain the
+        // failed flight rather than creating a second one on a manual retry.
+        if (!createRequested) {
+          _desktopFirstBindingFlight = null;
+          _desktopFirstBindingConfig = null;
+        }
+        rethrow;
+      }
+    }
+
+    return _desktopFirstBindingFlight = bind();
+  }
+
+  /// Binds an existing durable session or creates only for an explicit first
+  /// action. Read/recovery acquisition never uses this creation path.
   Future<DesktopSessionBinding> _bindDesktopSessionForFirstSubmit(
     HermesDesktopGateway gateway, {
     required String profile,
@@ -19272,73 +19498,30 @@ class ActiveChat {
       }
       var runtimeId = _desktopRuntimeSessionId;
       if (runtimeId == null) {
-        final draftSource = serverSessionId;
-        final draftSessionEpoch = _desktopSessionEpoch;
-        final draftBindEpoch = _desktopBindEpoch;
-        final draftWasUnbound = _desktopStoredSessionId == null;
-        final connectionRequestAtResumeStart = _connectionCard.request;
-        final binding = await _bindDesktopSessionForFirstSubmit(
+        final binding = await _bindDesktopSessionForFirstAction(
           gateway,
           profile: profile,
           history: history,
           legacyModel: model,
           config: sessionConfig,
         );
-        // Resume is acquisition only; it cannot renew a revoked send.
         if (_turnEpoch != turnEpoch || _runTerminal) return false;
         ensurePromptAdmission();
         runtimeId = binding.runtimeSessionId;
-        if (binding.created &&
-            _canRecoverTurn(turnEpoch) &&
-            draftWasUnbound &&
-            _desktopStoredSessionId == null &&
-            draftSource == sessionId &&
-            serverSessionId == draftSource &&
-            draftSessionEpoch == _desktopSessionEpoch &&
-            draftBindEpoch == _desktopBindEpoch &&
-            profile == sessionProfile &&
-            binding.storedSessionId.isNotEmpty) {
-          _createdDraftSessionId ??= binding.storedSessionId;
-        }
-        if (binding.created) {
-          // A5: la clave creada tiene que sobrevivir a process death ANTES de
-          // prompt.submit; sin ella un 404 del id provisional no prueba nada.
-          final createdKey = binding.storedSessionId;
-          final creatingDelivery = _activeTurnDelivery;
-          if (createdKey.isNotEmpty && creatingDelivery != null) {
-            await creatingDelivery.recordCreatedSession(createdKey);
-          }
-          _stagedFirstSubmitConfig = const DesktopSessionCreateConfig();
-          if (_activeTurnTranscriptBoundaryEpoch == turnEpoch &&
-              _activeTurnTranscriptBoundaryIdentity == null &&
-              !history.any(isRealUserTurn)) {
-            // Creation with no seeded user proves this turn owns the first row.
-            _activeTurnStartedFromKnownMissing = true;
-            // The boundary was captured against the provisional draft id. The
-            // created durable session is that same draft, so re-scope the
-            // boundary; otherwise the scope check fails once serverSessionId
-            // switches and the live first pair is never settled against its
-            // durable rows (QA 9340: duplicated first turn).
-            if (_activeTurnTranscriptBoundarySessionId == draftSource &&
-                binding.storedSessionId.isNotEmpty) {
-              _activeTurnTranscriptBoundarySessionId = binding.storedSessionId;
-            }
-          }
-        }
-        _desktopStoredSessionId = binding.storedSessionId;
-        _desktopStoredSessionKnownMissing = false;
-        _adoptDesktopRuntime(runtimeId, info: binding.info);
-        // The prompt being sent has not started a turn on the server yet:
-        // only the server's own `running` restores a plan as live.
-        _hydrateAgentTasks(binding.todoState, running: binding.running);
-        _restorePendingConnection(
-          binding,
-          heldAtResumeStart: connectionRequestAtResumeStart,
-        );
         boundOrAvailabilityResumedForSubmit = true;
-        if (binding.info != _desktopRuntimeInfo) {
-          _desktopRuntimeInfo = binding.info;
-          _emit(ActiveChatEvent.sessionInfo);
+      }
+      final createdKey = _createdDraftSessionId;
+      if (createdKey != null && createdKey == _desktopStoredSessionId) {
+        await _activeTurnDelivery?.recordCreatedSession(createdKey);
+        if (_turnEpoch != turnEpoch || _runTerminal) return false;
+        ensurePromptAdmission();
+        if (_activeTurnTranscriptBoundaryEpoch == turnEpoch &&
+            _activeTurnTranscriptBoundaryIdentity == null &&
+            !history.any(isRealUserTurn)) {
+          _activeTurnStartedFromKnownMissing = true;
+          if (_activeTurnTranscriptBoundarySessionId == sessionId) {
+            _activeTurnTranscriptBoundarySessionId = createdKey;
+          }
         }
       }
       if (beforeDesktopPromptSubmit != null) {

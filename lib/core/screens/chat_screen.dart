@@ -12601,6 +12601,7 @@ class _ChatScreenState extends State<ChatScreen>
       _slashSuggestions = const [];
     });
     try {
+      _chat.stageFirstSubmitConfig(_firstSubmitConfig);
       final result = await _chat.executeDesktopSlash(cmd.name, arg: arg);
       if (!mounted) return;
       if (result.accepted != DesktopCommandAcceptance.accepted) {

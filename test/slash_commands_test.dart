@@ -370,6 +370,54 @@ class _OpenSttEngine implements SttEngine {
   }
 }
 
+class _DraftSlashGateway extends _SlashGateway
+    implements HermesDesktopConfiguredSessionLifecycleGateway {
+  _DraftSlashGateway() {
+    resumeExistingError = const TuiGatewayRpcError(
+      'session.resume',
+      'Session not found',
+      code: 4007,
+    );
+  }
+
+  final List<({String profile, DesktopSessionCreateConfig config})> creates =
+      [];
+  final List<String> commandRuntimes = [];
+  final List<String> promptRuntimes = [];
+  Completer<DesktopSessionSnapshot>? createGate;
+
+  @override
+  Future<DesktopSessionSnapshot> createForFirstSubmitConfigured({
+    String profile = '',
+    List<Map<String, dynamic>> seedMessages = const [],
+    required DesktopSessionCreateConfig config,
+  }) async {
+    creates.add((profile: profile, config: config));
+    expectSync(seedMessages, isEmpty);
+    return createGate?.future ??
+        const DesktopSessionSnapshot(
+          runtimeSessionId: 'runtime-slash-test',
+          storedSessionId: 'created-draft',
+          created: true,
+        );
+  }
+
+  @override
+  Future<DesktopCommandRpcResult> slashExec(
+    String runtimeSessionId,
+    String command,
+  ) {
+    commandRuntimes.add(runtimeSessionId);
+    return super.slashExec(runtimeSessionId, command);
+  }
+
+  @override
+  Future<void> submitPrompt(String runtimeSessionId, String text) {
+    promptRuntimes.add(runtimeSessionId);
+    return super.submitPrompt(runtimeSessionId, text);
+  }
+}
+
 SavedConnection _connection() => SavedConnection(
   id: 'slash-widget',
   label: 'Slash QA',
@@ -430,10 +478,13 @@ Future<ActiveChat> _pumpSlashChat(
   CompressionRestoreStore? compressionRestoreStore,
   String? sessionProfile,
   bool? attachDesktopRuntimeOnLoad,
+  String? draftSessionId,
+  String? workspace,
 }) async {
-  final session = sessionProfile == null
-      ? _session
-      : _session.copyWith(profile: sessionProfile);
+  final session = _session.copyWith(
+    id: draftSessionId,
+    profile: sessionProfile,
+  );
   tester.platformDispatcher.localesTestValue = [const Locale('es')];
   addTearDown(tester.platformDispatcher.clearLocalesTestValue);
   final prefs = await SharedPreferences.getInstance();
@@ -445,10 +496,10 @@ Future<ActiveChat> _pumpSlashChat(
   final connection = _connection().copyWith(readOnly: readOnly);
   final chat = activeChats.attach(
     connection: connection,
-    sessionId: _session.id,
-    sessionTitle: _session.title,
+    sessionId: session.id,
+    sessionTitle: session.title,
     sessionProfile: sessionProfile,
-    initialStoredSessionId: bindInitialStoredSession ? _session.id : null,
+    initialStoredSessionId: bindInitialStoredSession ? session.id : null,
     api: _safeApi(),
     desktopGateway: gateway,
     attachDesktopRuntimeOnLoad: attachDesktopRuntimeOnLoad,
@@ -492,7 +543,11 @@ Future<ActiveChat> _pumpSlashChat(
   final navigatorContext = tester.element(find.byType(Navigator).first);
   Navigator.of(navigatorContext).push(
     MaterialPageRoute<void>(
-      builder: (_) => ChatScreen(connection: connection, session: session),
+      builder: (_) => ChatScreen(
+        connection: connection,
+        session: session,
+        newChatWorkspace: workspace,
+      ),
     ),
   );
   await tester.pump();
@@ -588,6 +643,55 @@ void main() {
       TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(MethodChannel(channel), null);
     }
+  });
+
+  group('draft slash binding', () {
+    test(
+      'captures full configuration and reuses runtime after command failure',
+      () async {
+        final gateway = _DraftSlashGateway()..slashError = _syntheticRpcError;
+        final service = ActiveChatService();
+        addTearDown(service.dispose);
+        final chat = service.attach(
+          connection: _connection(),
+          sessionId: 'mob-service-skill',
+          sessionTitle: 'Draft',
+          sessionProfile: 'coding',
+          api: _safeApi(),
+          desktopGateway: gateway,
+          disableForegroundKeepAlive: true,
+        );
+        final config = DesktopSessionCreateConfig(
+          model: DesktopModelSelection(
+            modelId: 'model-x',
+            providerSlug: 'provider-x',
+          ),
+          reasoningEffort: DesktopReasoningEffort.high,
+          fastMode: DesktopFastMode.normal,
+          title: 'Scoped draft',
+          hidden: true,
+          followProfileConfig: true,
+          allowTransportFallback: false,
+          workspace: '/projects/scoped',
+        );
+        chat.stageFirstSubmitConfig(config);
+        await expectLater(
+          chat.executeDesktopSlash('poteto-mode'),
+          throwsA(_syntheticRpcError),
+        );
+        expect(gateway.creates, [(profile: 'coding', config: config)]);
+        expect(chat.storedSessionId, 'created-draft');
+        expect(chat.createdDraftSessionId, 'created-draft');
+        gateway.slashError = null;
+        await chat.executeDesktopSlash('poteto-mode');
+        expect(gateway.creates, hasLength(1));
+        expect(gateway.commandRuntimes, [
+          'runtime-slash-test',
+          'runtime-slash-test',
+        ]);
+        expect(gateway.submissions, isEmpty);
+      },
+    );
   });
 
   group('slashSuggestionsFor', () {
@@ -1251,6 +1355,66 @@ void main() {
         find.byKey(const ValueKey('chat-slash-command-reset-stale')),
         findsNothing,
       );
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('unbound mobile draft first skill creates then sends once', (
+      tester,
+    ) async {
+      final gateway = _DraftSlashGateway()
+        ..slashResponder = ((text) => SlashCompletionBatch.fromJson(const {
+          'replace_from': 1,
+          'items': [
+            {'text': '/poteto-mode', 'meta': 'Poteto', 'kind': 'skill'},
+          ],
+        }, input: text))
+        ..slashError = const TuiGatewayRpcError(
+          'slash.exec',
+          'skill command: use command.dispatch for /poteto-mode',
+          code: 4018,
+        )
+        ..dispatchResult = DesktopCommandRpcResult.fromJson(const {
+          'type': 'skill',
+          'name': 'poteto-mode',
+          'message': 'Coding profile skill body',
+        });
+      final chat = await _pumpSlashChat(
+        tester,
+        gateway,
+        draftSessionId: 'mob-first-skill',
+        bindInitialStoredSession: false,
+        sessionProfile: 'coding',
+        workspace: '/projects/console',
+      );
+      expect(chat.storedSessionId, isNull);
+      expect(chat.desktopRuntimeSessionId, isNull);
+      expect(await chat.ensureDesktopRuntime(), isFalse);
+      expect(
+        await chat.ensureDesktopRuntime(acquireForExplicitAction: true),
+        isFalse,
+      );
+      expect(gateway.creates, isEmpty);
+      final composer = find.byType(TextField).last;
+      await tester.enterText(composer, '/pot');
+      await tester.pump(const Duration(milliseconds: 300));
+      await tester.enterText(composer, '/poteto-mode');
+      await tester.pump(const Duration(milliseconds: 300));
+      await _submitSlash(tester);
+      expect(gateway.creates, hasLength(1));
+      expect(gateway.creates.single.profile, 'coding');
+      expect(gateway.creates.single.config.workspace, '/projects/console');
+      expect(chat.storedSessionId, 'created-draft');
+      expect(chat.desktopRuntimeSessionId, 'runtime-slash-test');
+      expect(gateway.commandRuntimes, ['runtime-slash-test']);
+      expect(gateway.dispatchCalls, [
+        {'name': 'poteto-mode', 'arg': ''},
+      ]);
+      expect(gateway.submissions, ['Coding profile skill body']);
+      expect(gateway.promptRuntimes, ['runtime-slash-test']);
+      expect(chat.createdDraftSessionId, 'created-draft');
+      expect(chat.storedSessionId, 'created-draft');
+      gateway.emit('message.complete', {'text': 'ok'});
+      await tester.pump(const Duration(milliseconds: 500));
       expect(tester.takeException(), isNull);
     });
 

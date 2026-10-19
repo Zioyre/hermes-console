@@ -1,3 +1,5 @@
+import '../models/command_message.dart';
+
 /// Frontera común para payloads de capacidades remotas.
 ///
 /// Los métodos operacionales conservan únicamente los campos que necesita la
@@ -45,7 +47,7 @@ final class CapabilityPayloadSanitizer {
     final type = _identifier(value['type'], 32);
     final status = _identifier(value['status'], 32);
     final output = commandOutput(value['output']);
-    final message = boundedText(value['message'], 8000, preserveNewlines: true);
+    final message = parseCommandMessage(value['message']);
     final notice = boundedText(
       value['notice'] ?? value['warning'],
       1000,

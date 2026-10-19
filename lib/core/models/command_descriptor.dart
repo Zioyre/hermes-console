@@ -1,4 +1,5 @@
 import 'capability_descriptor.dart';
+import 'command_message.dart';
 import 'desktop_compression_outcome.dart';
 import 'desktop_compression_result.dart';
 
@@ -667,7 +668,7 @@ final class DesktopCommandRpcResult {
     final json = Map<Object?, Object?>.from(value);
     final type = json['type'];
     final output = _boundedText(json['output'], 4000);
-    final message = _boundedText(json['message'], 8000);
+    final message = parseCommandMessage(json['message']);
     final notice = _boundedText(json['notice'] ?? json['warning'], 1000);
     final target = CommandDescriptor.tryNormalizeName(json['target']);
     final commandName = CommandDescriptor.tryNormalizeName(json['name']);

@@ -139,6 +139,57 @@ void main() {
     expect(dispatch.kind, DesktopCommandDispatchKind.output);
   });
 
+  test('long skill directives survive the WebSocket client intact', () async {
+    final message = '${'Complete skill instructions.\n' * 800}END OF SKILL';
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(server.close);
+    final requests = <Map<String, dynamic>>[];
+    server.listen((request) async {
+      final socket = await WebSocketTransformer.upgrade(request);
+      socket.add(
+        jsonEncode({
+          'jsonrpc': '2.0',
+          'method': 'event',
+          'params': {'type': 'gateway.ready', 'payload': <String, dynamic>{}},
+        }),
+      );
+      await for (final raw in socket) {
+        final frame = jsonDecode(raw as String) as Map<String, dynamic>;
+        if (isClientCapabilitiesFrame(frame)) {
+          socket.add(jsonEncode(clientCapabilitiesResponse(frame)));
+          continue;
+        }
+        requests.add(frame);
+        socket.add(
+          jsonEncode({
+            'jsonrpc': '2.0',
+            'id': frame['id'],
+            'result': frame['method'] == 'gateway.capabilities'
+                ? {'per_session_exclusive_submit': true}
+                : {'type': 'skill', 'name': 'long-skill', 'message': message},
+          }),
+        );
+      }
+    });
+    final client = _clientFor(server);
+    addTearDown(client.close);
+
+    final result = await client.commandDispatch(
+      'runtime-long-skill',
+      name: 'long-skill',
+      arg: 'do the task',
+    );
+
+    expect(requests.last['method'], 'command.dispatch');
+    expect(requests.last['params'], {
+      'session_id': 'runtime-long-skill',
+      'name': 'long-skill',
+      'arg': 'do the task',
+    });
+    expect(result.kind, DesktopCommandDispatchKind.skill);
+    expect(result.message, message);
+  });
+
   test(
     'completion conserva trailing space y descarta replace_from inválido',
     () {
